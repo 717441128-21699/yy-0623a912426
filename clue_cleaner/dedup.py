@@ -25,9 +25,18 @@ class DedupEngine:
     def run(self,
             campaign_df: pd.DataFrame,
             history_df: pd.DataFrame = None,
-            following_df: pd.DataFrame = None) -> Dict[str, Any]:
+            following_df: pd.DataFrame = None,
+            filters: Dict = None) -> Dict[str, Any]:
         if campaign_df is None or campaign_df.empty:
             raise ValueError("本次投放数据不能为空")
+
+        if filters:
+            f_parts = []
+            for k, v in filters.items():
+                if v:
+                    f_parts.append(f"{k}={v}")
+            if f_parts:
+                self._log("\n🔍 应用筛选条件: " + ", ".join(f_parts), Fore.YELLOW)
 
         self._log("\n🚀 启动判重引擎...", Fore.CYAN + Style.BRIGHT)
 
@@ -39,7 +48,8 @@ class DedupEngine:
                 row_index=idx,
                 original_row=row,
                 original_channel=orig_ch,
-                final_channel=orig_ch
+                final_channel=orig_ch,
+                linked_channels=[orig_ch] if orig_ch else []
             )
 
         self._log(f"📥 加载投放线索: {len(records)} 条", Fore.CYAN)
@@ -57,7 +67,7 @@ class DedupEngine:
         self._resolve_channel_priority(records)
         self._decide_keep_or_remove(records)
 
-        summary = self._generate_summary(records)
+        summary = self._generate_summary(records, campaign_df, filters)
         self._print_summary(summary)
 
         return {
@@ -449,10 +459,6 @@ class DedupEngine:
 
     def _resolve_channel_priority(self, records: Dict[Any, DedupRecord]):
         for rec in records.values():
-            if not rec.matched_rules:
-                rec.final_channel = rec.original_channel
-                continue
-
             hit_channels = set()
             for m in rec.matched_rules:
                 if m.source_type == SourceType.HISTORY:
@@ -464,14 +470,34 @@ class DedupEngine:
                     if target_ch:
                         hit_channels.add(target_ch)
 
-            if hit_channels:
-                rec.hit_channel = '; '.join(sorted(hit_channels))
+            if not rec.matched_rules:
+                rec.final_channel = rec.original_channel
             else:
-                rec.hit_channel = ""
+                if hit_channels:
+                    rec.hit_channel = '; '.join(sorted(hit_channels))
+                candidates = [rec.original_channel] + list(hit_channels)
+                best_channel = min(candidates, key=lambda c: self.config.get_channel_priority(c))
+                rec.final_channel = best_channel
 
-            candidates = [rec.original_channel] + list(hit_channels)
-            best_channel = min(candidates, key=lambda c: self.config.get_channel_priority(c))
-            rec.final_channel = best_channel
+            all_chs = set(rec.linked_channels)
+            if rec.original_channel:
+                all_chs.add(rec.original_channel)
+            all_chs.update(hit_channels)
+            for m in rec.matched_rules:
+                if m.source_type == SourceType.CAMPAIGN and m.target_index in records:
+                    tgt = records[m.target_index]
+                    if tgt.original_channel:
+                        all_chs.add(tgt.original_channel)
+            rec.linked_channels = sorted(all_chs)
+
+        for rec in records.values():
+            for m in rec.matched_rules:
+                if m.source_type == SourceType.CAMPAIGN and m.target_index in records:
+                    tgt = records[m.target_index]
+                    merged = set(rec.linked_channels) | set(tgt.linked_channels)
+                    merged_list = sorted(merged)
+                    rec.linked_channels = merged_list
+                    tgt.linked_channels = merged_list
 
     def _decide_keep_or_remove(self, records: Dict[Any, DedupRecord]):
         for rec in records.values():
@@ -484,10 +510,33 @@ class DedupEngine:
             else:
                 rec.keep_row = True
 
-    def _generate_summary(self, records: Dict[Any, DedupRecord]) -> Dict:
+    def _generate_summary(self, records: Dict[Any, DedupRecord],
+                          campaign_df: pd.DataFrame = None,
+                          filters: Dict = None) -> Dict:
         summary = defaultdict(int)
         by_channel = defaultdict(lambda: defaultdict(int))
-        by_orig_channel = defaultdict(lambda: defaultdict(int))
+        by_orig_channel = defaultdict(lambda: defaultdict(float))
+
+        cost_col = None
+        if campaign_df is not None:
+            for cand in ['cost', 'budget', '消耗', '花费', '成本', '投放成本']:
+                if cand in campaign_df.columns:
+                    cost_col = cand
+                    break
+            if cost_col is None:
+                for col in campaign_df.columns:
+                    if any(k in str(col) for k in ['消耗', '花费', '成本', 'cost', 'spend']):
+                        cost_col = col
+                        break
+
+        def _to_float(v):
+            try:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return 0.0
+                s = str(v).replace(',', '').replace('￥', '').replace('¥', '').strip()
+                return float(s) if s else 0.0
+            except (ValueError, TypeError):
+                return 0.0
 
         for rec in records.values():
             summary[rec.level.value] += 1
@@ -501,19 +550,31 @@ class DedupEngine:
                 summary['old_customer'] += 1
             if rec.is_in_following:
                 summary['following'] += 1
-            by_orig_channel[rec.original_channel]['total'] += 1
+            ch = rec.original_channel
+            by_orig_channel[ch]['total'] += 1
             if rec.keep_row:
-                by_orig_channel[rec.original_channel]['keep_count'] += 1
+                by_orig_channel[ch]['keep_count'] += 1
             else:
-                by_orig_channel[rec.original_channel]['remove_count'] += 1
+                by_orig_channel[ch]['remove_count'] += 1
             if rec.is_old_customer:
-                by_orig_channel[rec.original_channel]['old_customer'] += 1
+                by_orig_channel[ch]['old_customer'] += 1
             if rec.is_in_following:
-                by_orig_channel[rec.original_channel]['following'] += 1
+                by_orig_channel[ch]['following'] += 1
             if rec.level == DedupLevel.DEFINITE:
-                by_orig_channel[rec.original_channel]['definite_dup'] += 1
+                by_orig_channel[ch]['definite_dup'] += 1
             if rec.level in [DedupLevel.PROBABLE, DedupLevel.POSSIBLE]:
-                by_orig_channel[rec.original_channel]['review_count'] += 1
+                by_orig_channel[ch]['review_count'] += 1
+
+            if cost_col and campaign_df is not None and rec.row_index in campaign_df.index:
+                cv = _to_float(campaign_df.loc[rec.row_index].get(cost_col, 0))
+                by_orig_channel[ch]['total_spent'] += cv
+                summary['total_spent'] += cv
+                if rec.keep_row:
+                    by_orig_channel[ch]['keep_spent'] += cv
+                    summary['keep_spent'] += cv
+                else:
+                    by_orig_channel[ch]['wasted_spent'] += cv
+                    summary['wasted_spent'] += cv
 
         summary['dup_count'] = summary['total'] - summary['keep_count']
         if summary['total'] > 0:
@@ -522,17 +583,30 @@ class DedupEngine:
                 (summary.get('确定重复', 0) + summary.get('老客复咨', 0) + summary.get('在跟名单', 0))
                 / summary['total'] * 100, 1
             )
+        if summary.get('keep_count', 0) > 0 and summary.get('keep_spent', 0) > 0:
+            summary['effective_cost'] = round(summary['keep_spent'] / summary['keep_count'], 2)
+        else:
+            summary['effective_cost'] = 0.0
 
         for ch, data in by_orig_channel.items():
-            total = data['total']
+            total = data.get('total', 0)
             keep = data.get('keep_count', 0)
             data['remove_count'] = total - keep
             data['water_rate'] = round((total - keep) / total * 100, 1) if total else 0
+            ts = float(data.get('total_spent', 0))
+            ks = float(data.get('keep_spent', 0))
+            data['total_spent'] = round(ts, 2)
+            data['keep_spent'] = round(ks, 2)
+            data['wasted_spent'] = round(ts - ks, 2)
+            data['effective_cost'] = round(ks / keep, 2) if keep and ks > 0 else 0.0
+            data['cost_per_lead'] = round(ts / total, 2) if total and ts > 0 else 0.0
 
         return {
             'counts': dict(summary),
             'by_channel': {k: dict(v) for k, v in by_channel.items()},
-            'by_original_channel': {k: dict(v) for k, v in by_orig_channel.items()}
+            'by_original_channel': {k: dict(v) for k, v in by_orig_channel.items()},
+            'cost_column': cost_col,
+            'filters': filters or {}
         }
 
     def _print_summary(self, summary: Dict):
@@ -540,6 +614,18 @@ class DedupEngine:
         self._log("\n" + "=" * 60, Fore.CYAN)
         self._log("🎯 判重结果汇总", Fore.CYAN + Style.BRIGHT)
         self._log("=" * 60, Fore.CYAN)
+        filters = summary.get('filters', {})
+        if filters:
+            f_items = [f"{k}={v}" for k, v in filters.items() if v]
+            if f_items:
+                self._log("  筛选条件:     " + ", ".join(f_items), Fore.YELLOW)
+        cost_col = summary.get('cost_column')
+        if cost_col and counts.get('total_spent', 0) > 0:
+            self._log(f"  识别成本列:   {cost_col}", Fore.LIGHTMAGENTA_EX)
+            self._log(f"  总花费:       ￥{counts.get('total_spent', 0):.2f}", Fore.LIGHTMAGENTA_EX)
+            self._log(f"  无效花费:     ￥{counts.get('wasted_spent', 0):.2f}", Fore.RED)
+            self._log(f"  有效成本:     ￥{counts.get('effective_cost', 0):.2f} / 条", Fore.GREEN)
+            self._log("-" * 60, Fore.CYAN)
         self._log(f"  总线索数:     {counts.get('total', 0)}")
         self._log(f"  独立线索:     {counts.get('独立线索', 0)}", Fore.GREEN)
         self._log(f"  确定重复:     {counts.get('确定重复', 0)}", Fore.RED)

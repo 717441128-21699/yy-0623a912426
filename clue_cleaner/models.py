@@ -69,6 +69,7 @@ class DedupRecord:
     final_channel: str = ""
     original_channel: str = ""
     hit_channel: str = ""
+    linked_channels: List[str] = field(default_factory=list)
     is_old_customer: bool = False
     is_in_following: bool = False
     keep_row: bool = True
@@ -83,6 +84,7 @@ class DedupRecord:
         d['_original_channel'] = self.original_channel
         d['_hit_channel'] = self.hit_channel
         d['_final_channel'] = self.final_channel
+        d['_linked_channels'] = '; '.join(sorted(set(self.linked_channels)))
         d['_is_old_customer'] = '是' if self.is_old_customer else '否'
         d['_is_in_following'] = '是' if self.is_in_following else '否'
         d['_keep'] = '保留' if self.keep_row else '剔除'

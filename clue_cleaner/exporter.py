@@ -53,8 +53,14 @@ class Exporter:
             d['_原始渠道'] = r.original_channel
             d['_命中渠道'] = r.hit_channel
             d['_最终归属渠道'] = r.final_channel
+            linked = sorted(set(r.linked_channels) - {r.original_channel, r.final_channel}
+                            if r.linked_channels else set())
+            d['_关联渠道(除归属外)'] = '; '.join(linked)
+            d['_全部关联渠道'] = '; '.join(sorted(set(r.linked_channels))) if r.linked_channels else r.original_channel
+            d['_关联渠道数'] = len(set(r.linked_channels)) if r.linked_channels else 1
             d['_老客复咨'] = '是' if r.is_old_customer else '否'
             d['_门店在跟'] = '是' if r.is_in_following else '否'
+            d['_匹配对象行号'] = '; '.join([str(x) for x in r.matched_with])
             rows.append(d)
 
         df = pd.DataFrame(rows)
@@ -91,6 +97,8 @@ class Exporter:
                     '原始渠道': r.original_channel,
                     '命中渠道': r.hit_channel,
                     '最终归属渠道': r.final_channel,
+                    '全部关联渠道': '; '.join(sorted(set(r.linked_channels))) if r.linked_channels else r.original_channel,
+                    '关联渠道数': len(set(r.linked_channels)) if r.linked_channels else 1,
                     '是否保留': '是' if r.keep_row else '否',
                     '手机号': r.original_row.get('phone', ''),
                     '微信号': r.original_row.get('wechat', ''),
@@ -111,9 +119,17 @@ class Exporter:
         path = self._p(filename)
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
             counts = summary['counts']
-            df_overall = pd.DataFrame([
-                {'指标': k, '数值': v} for k, v in counts.items()
-            ])
+            cost_col = summary.get('cost_column')
+            filter_rows = []
+            filters = summary.get('filters', {})
+            if filters:
+                for k, v in filters.items():
+                    filter_rows.append({'筛选项': k, '值': v})
+            filter_rows.append({'筛选项': '成本列识别', '值': cost_col or '未识别到'})
+            filter_rows.append({'筛选项': '导出时间', '值': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+            pd.DataFrame(filter_rows).to_excel(writer, sheet_name='筛选条件', index=False)
+
+            df_overall = pd.DataFrame([{'指标': k, '数值': v} for k, v in counts.items()])
             df_overall.to_excel(writer, sheet_name='整体汇总', index=False)
 
             by_ch = summary.get('by_channel', {})
@@ -139,6 +155,11 @@ class Exporter:
                     '确定重复': data.get('definite_dup', 0),
                     '待复核': data.get('review_count', 0),
                     '挤水率%': data.get('water_rate', 0),
+                    '总花费': round(float(data.get('total_spent', 0)), 2),
+                    '有效花费': round(float(data.get('keep_spent', 0)), 2),
+                    '浪费花费': round(float(data.get('wasted_spent', 0)), 2),
+                    '单条投放成本': round(float(data.get('cost_per_lead', 0)), 2),
+                    '有效获客成本': round(float(data.get('effective_cost', 0)), 2),
                 })
             if orig_rows:
                 df_orig = pd.DataFrame(orig_rows)
@@ -245,6 +266,8 @@ class Exporter:
         summary = dedup_result['summary']
         counts = summary['counts']
         by_orig = summary.get('by_original_channel', {})
+        filters = summary.get('filters', {})
+        cost_col = summary.get('cost_column')
 
         total = counts.get('total', 0)
         keep = counts.get('keep_count', 0)
@@ -254,9 +277,15 @@ class Exporter:
         probable = counts.get('大概率重复', 0)
         possible = counts.get('疑似重复', 0)
         review_count = probable + possible
+        total_spent = float(counts.get('total_spent', 0) or 0)
+        keep_spent = float(counts.get('keep_spent', 0) or 0)
+        wasted_spent = float(counts.get('wasted_spent', 0) or 0)
+        eff_cost = counts.get('effective_cost', 0) or 0
 
         report = {
             '生成时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            '筛选条件': filters or {},
+            '成本列识别': cost_col or '',
             '总投放线索': total,
             '有效线索': keep,
             '老客复咨': old_c,
@@ -265,7 +294,11 @@ class Exporter:
             '待复核': review_count,
             '挤水率%': counts.get('water_rate', 0),
             '重复率%': counts.get('dup_rate', 0),
-            '各渠道明细': {}
+            '总花费(元)': round(total_spent, 2),
+            '有效花费(元)': round(keep_spent, 2),
+            '浪费花费(元)': round(wasted_spent, 2),
+            '有效获客成本(元/条)': round(eff_cost, 2),
+            '各渠道明细': {},
         }
 
         for ch, data in by_orig.items():
@@ -278,14 +311,83 @@ class Exporter:
                 '确定重复': data.get('definite_dup', 0),
                 '待复核': data.get('review_count', 0),
                 '挤水率%': data.get('water_rate', 0),
+                '总花费(元)': round(float(data.get('total_spent', 0) or 0), 2),
+                '有效花费(元)': round(float(data.get('keep_spent', 0) or 0), 2),
+                '有效获客成本(元/条)': round(float(data.get('effective_cost', 0) or 0), 2),
             }
+
+        best_by_keep = max(report['各渠道明细'].items(),
+                           key=lambda x: (x[1]['有效线索'], -x[1]['挤水率%']),
+                           default=(None, None))
+        best_by_effcost = None
+        candidates = [(ch, d) for ch, d in report['各渠道明细'].items()
+                      if d['有效线索'] > 0 and d['有效获客成本(元/条)'] > 0]
+        if candidates:
+            best_by_effcost = min(candidates, key=lambda x: x[1]['有效获客成本(元/条)'])
+        worst_by_water = max(report['各渠道明细'].items(),
+                             key=lambda x: (x[1]['挤水率%'], x[1]['投放量']),
+                             default=(None, None))
+        worst_by_effcost = None
+        if candidates:
+            worst_by_effcost = max(candidates, key=lambda x: x[1]['有效获客成本(元/条)'])
+
+        filter_desc = ''
+        if filters:
+            items = [f"{k}={v}" for k, v in filters.items() if v]
+            if items:
+                filter_desc = f"（筛选条件：{'、'.join(items)}）"
+
+        conclusion_lines = [
+            f"【运营数据复盘{filter_desc}】",
+            f"  本批次共投放 {total} 条线索，挤水后保留有效 {keep} 条（挤水率 {counts.get('water_rate', 0)}%）。",
+            f"  其中老客复咨 {old_c} 条、门店在跟 {following} 条、待人工复核 {review_count} 条。",
+        ]
+        if cost_col and total_spent > 0:
+            conclusion_lines.append(
+                f"  识别成本列「{cost_col}」，合计花费 ￥{total_spent:.2f}，浪费 ￥{wasted_spent:.2f}，"
+                f"真实获客成本约 ￥{eff_cost:.2f}/条。"
+            )
+        if best_by_keep[0]:
+            ch, d = best_by_keep
+            conclusion_lines.append(
+                f"  最佳获客渠道：{ch}（有效 {d['有效线索']} 条，挤水率 {d['挤水率%']}%）。"
+            )
+        if best_by_effcost:
+            ch, d = best_by_effcost
+            conclusion_lines.append(
+                f"  最划算渠道：{ch}（有效获客成本 ￥{d['有效获客成本(元/条)']:.2f}/条）。"
+            )
+        if worst_by_water[0]:
+            ch, d = worst_by_water
+            conclusion_lines.append(
+                f"  水分最高渠道：{ch}（挤水率 {d['挤水率%']}%，投放 {d['投放量']} 条），建议优化投放人群或素材。"
+            )
+        if worst_by_effcost and worst_by_effcost[0] != (worst_by_water[0] if worst_by_water else None):
+            ch, d = worst_by_effcost
+            conclusion_lines.append(
+                f"  成本偏高渠道：{ch}（有效获客成本 ￥{d['有效获客成本(元/条)']:.2f}/条），可考虑降低出价或换定向。"
+            )
+        if review_count > 0:
+            conclusion_lines.append(
+                f"  ⚠ 仍有 {review_count} 条疑似重复待人工复核，建议 24 小时内完成确认后更新报表。"
+            )
+
+        report['运营结论'] = conclusion_lines
+        conclusion_text = '\n'.join(conclusion_lines)
 
         os.makedirs(self.output_dir, exist_ok=True)
         xlsx_path = self._p(filename)
         with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+            pd.DataFrame([{
+                '序号': i + 1,
+                '运营结论': line
+            } for i, line in enumerate(conclusion_lines)]).to_excel(
+                writer, sheet_name='运营结论', index=False
+            )
+
             overview_rows = []
             for k, v in report.items():
-                if k == '各渠道明细':
+                if k in ('各渠道明细', '运营结论'):
                     continue
                 overview_rows.append({'指标': k, '数值': v})
             pd.DataFrame(overview_rows).to_excel(writer, sheet_name='核心指标', index=False)
@@ -310,6 +412,7 @@ class Exporter:
                         '投放量': data['投放量'],
                         '挤水率%': data['挤水率%'],
                         '有效线索': data['有效线索'],
+                        '有效获客成本(元/条)': data['有效获客成本(元/条)'],
                         '老客+在跟': data.get('老客复咨', 0) + data.get('门店在跟', 0),
                         '建议': '重点关注' if data['挤水率%'] > 20 else '正常'
                     })
@@ -317,6 +420,9 @@ class Exporter:
                 pd.DataFrame(alert_rows).to_excel(writer, sheet_name='水分预警', index=False)
 
         self._log(f"✅ 导出运营周报 → {xlsx_path}", Fore.GREEN)
+        self._log(f"   📝 运营结论已生成，可直接复制到日报/周会", Fore.LIGHTCYAN_EX)
+        for line in conclusion_lines[:2]:
+            self._log(f"   {line}", Fore.LIGHTCYAN_EX)
 
         json_path = os.path.join(self.output_dir, json_filename.replace('.json', f'_{self._ts()}.json'))
         with open(json_path, 'w', encoding='utf-8') as f:
@@ -339,6 +445,12 @@ class BatchComparator:
                 label_a: str = "批次A", label_b: str = "批次B") -> Dict:
         recs_a = result_a['records']
         recs_b = result_b['records']
+        summary_a = result_a.get('summary', {})
+        summary_b = result_b.get('summary', {})
+        filters_a = summary_a.get('filters', {})
+        filters_b = summary_b.get('filters', {})
+        cost_a = summary_a.get('cost_column')
+        cost_b = summary_b.get('cost_column')
 
         def _key_set(records):
             keys = set()
@@ -360,50 +472,123 @@ class BatchComparator:
         only_a = keys_a - keys_b
         only_b = keys_b - keys_a
 
-        sa = result_a['summary']['counts']
-        sb = result_b['summary']['counts']
-        ocha = result_a['summary'].get('by_original_channel', {})
-        ochb = result_b['summary'].get('by_original_channel', {})
+        sa = summary_a['counts']
+        sb = summary_b['counts']
+        ocha = summary_a.get('by_original_channel', {})
+        ochb = summary_b.get('by_original_channel', {})
 
         self._log("\n" + "=" * 70, Fore.CYAN)
         self._log(f"🔍 批次对比: {label_a} vs {label_b}", Fore.CYAN + Style.BRIGHT)
         self._log("=" * 70, Fore.CYAN)
+        if filters_a:
+            items_a = [f"{k}={v}" for k, v in filters_a.items() if v]
+            if items_a:
+                self._log(f"  {label_a}筛选: " + ", ".join(items_a), Fore.YELLOW)
+        if filters_b:
+            items_b = [f"{k}={v}" for k, v in filters_b.items() if v]
+            if items_b:
+                self._log(f"  {label_b}筛选: " + ", ".join(items_b), Fore.YELLOW)
+
         self._log(f"  {label_a}唯一键数: {len(keys_a)}")
         self._log(f"  {label_b}唯一键数: {len(keys_b)}")
         self._log(f"  两批共有: {len(common)}", Fore.GREEN)
         self._log(f"  仅{label_a}: {len(only_a)}", Fore.YELLOW)
         self._log(f"  仅{label_b}: {len(only_b)}", Fore.YELLOW)
 
-        self._log(f"\n  {label_a} 有效线索: {sa.get('keep_count', 0)} (挤水率{sa.get('water_rate', 0)}%)")
-        self._log(f"  {label_b} 有效线索: {sb.get('keep_count', 0)} (挤水率{sb.get('water_rate', 0)}%)")
-        delta = sb.get('keep_count', 0) - sa.get('keep_count', 0)
+        self._log(f"\n  {label_a} 有效线索: {int(sa.get('keep_count',0) or 0)} (挤水率{sa.get('water_rate', 0)}%)")
+        self._log(f"  {label_b} 有效线索: {int(sb.get('keep_count',0) or 0)} (挤水率{sb.get('water_rate', 0)}%)")
+        delta = int(sb.get('keep_count', 0) - sa.get('keep_count', 0))
         delta_w = round(sb.get('water_rate', 0) - sa.get('water_rate', 0), 1)
         self._log(f"  有效线索变化: {delta:+d}", Fore.GREEN if delta > 0 else Fore.RED)
         self._log(f"  挤水率变化: {delta_w:+.1f}%", Fore.RED if delta_w > 0 else Fore.GREEN)
 
+        ta_spent = float(sa.get('total_spent', 0) or 0)
+        tb_spent = float(sb.get('total_spent', 0) or 0)
+        ta_keep_spent = float(sa.get('keep_spent', 0) or 0)
+        tb_keep_spent = float(sb.get('keep_spent', 0) or 0)
+        ta_effcost = sa.get('effective_cost', 0) or 0
+        tb_effcost = sb.get('effective_cost', 0) or 0
+        if (cost_a or ta_spent > 0) and (cost_b or tb_spent > 0):
+            d_effcost = round(tb_effcost - ta_effcost, 2)
+            self._log(f"  总花费: ￥{ta_spent:.2f} → ￥{tb_spent:.2f} ({tb_spent - ta_spent:+.2f})", Fore.LIGHTMAGENTA_EX)
+            self._log(f"  有效成本: ￥{ta_effcost:.2f} → ￥{tb_effcost:.2f} ({d_effcost:+.2f})", Fore.LIGHTGREEN_EX if d_effcost < 0 else Fore.LIGHTRED_EX)
+
         self._log(f"\n  📊 渠道复盘明细:", Fore.CYAN)
         all_ch = set(ocha.keys()) | set(ochb.keys())
+        channel_detail = {}
         for ch in sorted(all_ch):
             a_data = ocha.get(ch, {})
             b_data = ochb.get(ch, {})
-            a_total = a_data.get('total', 0)
-            b_total = b_data.get('total', 0)
-            a_keep = a_data.get('keep_count', 0)
-            b_keep = b_data.get('keep_count', 0)
+            a_total = int(a_data.get('total', 0) or 0)
+            b_total = int(b_data.get('total', 0) or 0)
+            a_keep = int(a_data.get('keep_count', 0) or 0)
+            b_keep = int(b_data.get('keep_count', 0) or 0)
             a_wr = a_data.get('water_rate', 0)
             b_wr = b_data.get('water_rate', 0)
-            d_keep = b_keep - a_keep
+            d_keep = int(b_keep - a_keep)
             d_wr = round(b_wr - a_wr, 1)
+            a_ts = float(a_data.get('total_spent', 0) or 0)
+            b_ts = float(b_data.get('total_spent', 0) or 0)
+            a_ec = float(a_data.get('effective_cost', 0) or 0)
+            b_ec = float(b_data.get('effective_cost', 0) or 0)
+            d_spent = round(b_ts - a_ts, 2)
+            d_ec = round(b_ec - a_ec, 2)
             water_tag = "↑水分变高" if d_wr > 5 else ("↓水分改善" if d_wr < -5 else "")
             real_tag = "↑获客变好" if d_keep > 0 else ("↓获客变差" if d_keep < 0 else "")
+            cost_tag = ""
+            if a_ec > 0 and b_ec > 0:
+                if d_ec > 0:
+                    cost_tag = "↑成本升高"
+                elif d_ec < 0:
+                    cost_tag = "↓成本降低"
+            combo_tag = ""
+            if d_wr < -5 and d_ec > 0:
+                combo_tag = "⚠水分降成本升，注意ROI"
+            elif d_wr < -5 and d_ec < 0:
+                combo_tag = "✅双优：水分+成本同步改善"
+            elif d_wr > 5 and d_ec > 0:
+                combo_tag = "🚨双劣：水分升高+成本升高"
+            elif d_keep > 0 and d_ec < 0:
+                combo_tag = "💰获客变强：量增+本降"
 
             self._log(f"    {ch}:", Fore.CYAN)
-            self._log(f"      投放 {a_total}→{b_total}  有效 {a_keep}→{b_keep}({d_keep:+d}) "
-                      f"挤水率 {a_wr}%→{b_wr}%({d_wr:+.1f}%)", Fore.WHITE)
+            base_str = f"      投放 {a_total}→{b_total}  有效 {a_keep}→{b_keep}({d_keep:+d}) " \
+                       f"挤水率 {a_wr}%→{b_wr}%({d_wr:+.1f}%)"
+            if (a_ts > 0 or b_ts > 0):
+                base_str += f"\n      花费 ￥{a_ts:.2f}→￥{b_ts:.2f}({d_spent:+.2f})  " \
+                            f"有效成本 ￥{a_ec:.2f}→￥{b_ec:.2f}({d_ec:+.2f})"
+            self._log(base_str, Fore.WHITE)
             if water_tag:
                 self._log(f"      ⚠ {water_tag}", Fore.RED if "高" in water_tag else Fore.GREEN)
             if real_tag:
                 self._log(f"      💡 {real_tag}", Fore.GREEN if "好" in real_tag else Fore.RED)
+            if cost_tag:
+                self._log(f"      💰 {cost_tag}", Fore.RED if "升高" in cost_tag else Fore.GREEN)
+            if combo_tag:
+                color = Fore.GREEN if combo_tag.startswith(("✅", "💰")) else (
+                    Fore.YELLOW if combo_tag.startswith("⚠") else Fore.RED)
+                self._log(f"      {combo_tag}", color + Style.BRIGHT)
+
+            channel_detail[ch] = {
+                'a_total': a_total, 'b_total': b_total,
+                'a_keep': a_keep, 'b_keep': b_keep,
+                'a_remove': a_data.get('remove_count', 0),
+                'b_remove': b_data.get('remove_count', 0),
+                'a_water_rate': a_wr, 'b_water_rate': b_wr,
+                'd_wr': d_wr, 'd_keep': d_keep,
+                'a_total_spent': round(a_ts, 2), 'b_total_spent': round(b_ts, 2),
+                'd_spent': d_spent,
+                'a_effective_cost': round(a_ec, 2), 'b_effective_cost': round(b_ec, 2),
+                'd_effective_cost': d_ec,
+                'water_trend': water_tag, 'real_trend': real_tag,
+                'cost_trend': cost_tag, 'combo_trend': combo_tag,
+                'a_old_customer': a_data.get('old_customer', 0),
+                'b_old_customer': b_data.get('old_customer', 0),
+                'a_following': a_data.get('following', 0),
+                'b_following': b_data.get('following', 0),
+                'a_review': a_data.get('review_count', 0),
+                'b_review': b_data.get('review_count', 0),
+            }
 
         self._log("=" * 70 + "\n", Fore.CYAN)
 
@@ -415,19 +600,11 @@ class BatchComparator:
             'summary_b': sb,
             'by_original_a': ocha,
             'by_original_b': ochb,
-            'channel_diff': {
-                ch: {
-                    'a_total': ocha.get(ch, {}).get('total', 0),
-                    'a_keep': ocha.get(ch, {}).get('keep_count', 0),
-                    'a_remove': ocha.get(ch, {}).get('remove_count', 0),
-                    'a_water_rate': ocha.get(ch, {}).get('water_rate', 0),
-                    'b_total': ochb.get(ch, {}).get('total', 0),
-                    'b_keep': ochb.get(ch, {}).get('keep_count', 0),
-                    'b_remove': ochb.get(ch, {}).get('remove_count', 0),
-                    'b_water_rate': ochb.get(ch, {}).get('water_rate', 0),
-                }
-                for ch in all_ch
-            }
+            'filters_a': filters_a,
+            'filters_b': filters_b,
+            'cost_column_a': cost_a,
+            'cost_column_b': cost_b,
+            'channel_diff': channel_detail
         }
 
     def export_comparison(self, cmp_result: Dict,
@@ -437,35 +614,62 @@ class BatchComparator:
         ts = datetime.now().strftime(self.config.output.get('date_format', '%Y%m%d_%H%M%S'))
         path = os.path.join(output_dir, f"批次对比_{ts}.xlsx")
 
+        sa = cmp_result['summary_a']
+        sb = cmp_result['summary_b']
+        filters_a = cmp_result.get('filters_a', {})
+        filters_b = cmp_result.get('filters_b', {})
+        cost_a = cmp_result.get('cost_column_a')
+        cost_b = cmp_result.get('cost_column_b')
+
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
+            info_rows = []
+            info_rows.append({'项目': f'{label_a}成本列', '值': cost_a or '未识别'})
+            info_rows.append({'项目': f'{label_b}成本列', '值': cost_b or '未识别'})
+            for k, v in filters_a.items():
+                info_rows.append({'项目': f'{label_a}_{k}', '值': v})
+            for k, v in filters_b.items():
+                info_rows.append({'项目': f'{label_b}_{k}', '值': v})
+            info_rows.append({'项目': '导出时间', '值': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+            pd.DataFrame(info_rows).to_excel(writer, sheet_name='筛选条件_说明', index=False)
+
             rows = []
             for ch in sorted(cmp_result['channel_diff'].keys()):
                 d = cmp_result['channel_diff'][ch]
-                d_keep = d['b_keep'] - d['a_keep']
-                d_wr = round(d['b_water_rate'] - d['a_water_rate'], 1)
                 rows.append({
                     '渠道': ch,
                     f'{label_a}_投放量': d['a_total'],
                     f'{label_b}_投放量': d['b_total'],
                     f'{label_a}_有效线索': d['a_keep'],
                     f'{label_b}_有效线索': d['b_keep'],
-                    '有效线索变化': d_keep,
+                    '有效线索变化': d['d_keep'],
                     f'{label_a}_剔除量': d['a_remove'],
                     f'{label_b}_剔除量': d['b_remove'],
                     f'{label_a}_挤水率%': d['a_water_rate'],
                     f'{label_b}_挤水率%': d['b_water_rate'],
-                    '挤水率变化': d_wr,
-                    '水分趋势': '↑变高' if d_wr > 5 else ('↓改善' if d_wr < -5 else '持平'),
-                    '获客趋势': '↑变好' if d_keep > 0 else ('↓变差' if d_keep < 0 else '持平'),
+                    '挤水率变化': d['d_wr'],
+                    f'{label_a}_总花费': d['a_total_spent'],
+                    f'{label_b}_总花费': d['b_total_spent'],
+                    '花费变化': d['d_spent'],
+                    f'{label_a}_有效获客成本': d['a_effective_cost'],
+                    f'{label_b}_有效获客成本': d['b_effective_cost'],
+                    '有效成本变化': d['d_effective_cost'],
+                    '水分趋势': d['water_trend'] or '持平',
+                    '获客趋势': d['real_trend'] or '持平',
+                    '成本趋势': d['cost_trend'] or '持平',
+                    '综合结论': d['combo_trend'] or '-',
                 })
             pd.DataFrame(rows).to_excel(writer, sheet_name='渠道复盘', index=False)
 
-            sa = cmp_result['summary_a']
-            sb = cmp_result['summary_b']
             rows2 = []
             all_keys = set(sa.keys()) | set(sb.keys())
             for k in sorted(all_keys):
-                rows2.append({'指标': k, label_a: sa.get(k, 0), label_b: sb.get(k, 0), '变化': sb.get(k, 0) - sa.get(k, 0)})
+                va = sa.get(k, 0)
+                vb = sb.get(k, 0)
+                try:
+                    change = round(vb - va, 2)
+                except Exception:
+                    change = '-'
+                rows2.append({'指标': k, label_a: va, label_b: vb, '变化': change})
             pd.DataFrame(rows2).to_excel(writer, sheet_name='整体对比', index=False)
 
             if cmp_result.get('only_b_keys'):
@@ -487,16 +691,122 @@ class BatchComparator:
 
         sa = cmp_result['summary_a']
         sb = cmp_result['summary_b']
+        filters_a = cmp_result.get('filters_a', {})
+        filters_b = cmp_result.get('filters_b', {})
+        cost_a = cmp_result.get('cost_column_a')
+        cost_b = cmp_result.get('cost_column_b')
+
+        ta_total = sa.get('total', 0)
+        tb_total = sb.get('total', 0)
+        ta_keep = sa.get('keep_count', 0)
+        tb_keep = sb.get('keep_count', 0)
+        ta_wr = sa.get('water_rate', 0)
+        tb_wr = sb.get('water_rate', 0)
+        ta_old = sa.get('老客复咨', 0)
+        tb_old = sb.get('老客复咨', 0)
+        ta_flw = sa.get('在跟名单', 0)
+        tb_flw = sb.get('在跟名单', 0)
+        ta_review = sa.get('大概率重复', 0) + sa.get('疑似重复', 0)
+        tb_review = sb.get('大概率重复', 0) + sb.get('疑似重复', 0)
+        ta_spent = float(sa.get('total_spent', 0) or 0)
+        tb_spent = float(sb.get('total_spent', 0) or 0)
+        ta_ec = sa.get('effective_cost', 0) or 0
+        tb_ec = sb.get('effective_cost', 0) or 0
+
+        fa_desc = []
+        fb_desc = []
+        if filters_a:
+            fa_desc = [f"{k}={v}" for k, v in filters_a.items() if v]
+        if filters_b:
+            fb_desc = [f"{k}={v}" for k, v in filters_b.items() if v]
+
+        conclusion_lines = [
+            f"【批次对比复盘：{label_a} vs {label_b}】",
+            f"  投放规模：{label_a} {ta_total}条 → {label_b} {tb_total}条 "
+            f"({'增' if tb_total > ta_total else '减' if tb_total < ta_total else '持平'}"
+            f" {abs(tb_total - ta_total)}条)",
+            f"  有效线索：{label_a} {ta_keep}条（{ta_wr}%挤水率）→ "
+            f"{label_b} {tb_keep}条（{tb_wr}%挤水率），"
+            f"有效线索{tb_keep - ta_keep:+d}条，挤水率{tb_wr - ta_wr:+.1f}%。",
+            f"  老客复咨：{ta_old} → {tb_old}，门店在跟：{ta_flw} → {tb_flw}，待复核：{ta_review} → {tb_review}。",
+        ]
+        if cost_a or cost_b or ta_spent > 0 or tb_spent > 0:
+            conclusion_lines.append(
+                f"  花费识别：{label_a}「{cost_a or '未识别'}」/ {label_b}「{cost_b or '未识别'}」，"
+                f"总花费 ￥{ta_spent:.2f} → ￥{tb_spent:.2f}({tb_spent - ta_spent:+.2f})。"
+            )
+        if (ta_ec > 0 or tb_ec > 0):
+            d_ec = round(tb_ec - ta_ec, 2)
+            conclusion_lines.append(
+                f"  有效获客成本：￥{ta_ec:.2f} → ￥{tb_ec:.2f}({d_ec:+.2f})，"
+                + ("成本更划算了。" if d_ec < 0 else "成本上升需关注。")
+            )
+
+        ch_items = list(cmp_result['channel_diff'].items())
+        if ch_items:
+            best_keep = max(ch_items, key=lambda x: x[1]['d_keep'])
+            if best_keep[1]['d_keep'] != 0:
+                d = best_keep[1]
+                conclusion_lines.append(
+                    f"  获客增长最多：{best_keep[0]}（有效{d['d_keep']:+d}条，"
+                    f"挤水率变化{d['d_wr']:+.1f}%）。"
+                )
+            ec_cand = [x for x in ch_items
+                       if x[1]['a_effective_cost'] > 0 and x[1]['b_effective_cost'] > 0
+                       and x[1]['b_keep'] > 0]
+            if ec_cand:
+                best_ec = min(ec_cand, key=lambda x: x[1]['d_effective_cost'])
+                d = best_ec[1]
+                if d['d_effective_cost'] != 0:
+                    conclusion_lines.append(
+                        f"  成本改善最多：{best_ec[0]}（有效成本{d['d_effective_cost']:+.2f}元/条）。"
+                    )
+            worst_wr = max(ch_items, key=lambda x: x[1]['d_wr'])
+            if worst_wr[1]['d_wr'] > 5:
+                d = worst_wr[1]
+                conclusion_lines.append(
+                    f"  ⚠ 渠道风险预警：{worst_wr[0]} 挤水率显著上升{d['d_wr']:+.1f}%，建议排查流量质量。"
+                )
+            bad_combo = [x for x in ch_items if '双劣' in x[1].get('combo_trend', '')]
+            if bad_combo:
+                names = '、'.join([x[0] for x in bad_combo])
+                conclusion_lines.append(f"  🚨 双劣警告（水升+本升）：{names}，需重点优化。")
+
+        if fa_desc or fb_desc:
+            desc_parts = []
+            if fa_desc:
+                desc_parts.append(f"{label_a}：{'/'.join(fa_desc)}")
+            if fb_desc:
+                desc_parts.append(f"{label_b}：{'/'.join(fb_desc)}")
+            conclusion_lines.append(f"  【注】本次对比筛选条件：{'；'.join(desc_parts)}。")
 
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
+            pd.DataFrame([{
+                '序号': i + 1,
+                '对比结论（可直接复制）': line
+            } for i, line in enumerate(conclusion_lines)]).to_excel(
+                writer, sheet_name='运营结论', index=False
+            )
+
+            info_rows = []
+            info_rows.append({'项目': f'{label_a}成本列', '值': cost_a or '未识别'})
+            info_rows.append({'项目': f'{label_b}成本列', '值': cost_b or '未识别'})
+            for k, v in filters_a.items():
+                info_rows.append({'项目': f'{label_a}_{k}', '值': v})
+            for k, v in filters_b.items():
+                info_rows.append({'项目': f'{label_b}_{k}', '值': v})
+            info_rows.append({'项目': '导出时间', '值': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
+            pd.DataFrame(info_rows).to_excel(writer, sheet_name='筛选条件_说明', index=False)
+
             overview = [
-                {'指标': '总投放', label_a: sa.get('total', 0), label_b: sb.get('total', 0)},
-                {'指标': '有效线索', label_a: sa.get('keep_count', 0), label_b: sb.get('keep_count', 0)},
-                {'指标': '老客复咨', label_a: sa.get('老客复咨', 0), label_b: sb.get('老客复咨', 0)},
-                {'指标': '门店在跟', label_a: sa.get('在跟名单', 0), label_b: sb.get('在跟名单', 0)},
-                {'指标': '待复核', label_a: sa.get('大概率重复', 0) + sa.get('疑似重复', 0),
-                 label_b: sb.get('大概率重复', 0) + sb.get('疑似重复', 0)},
-                {'指标': '挤水率%', label_a: sa.get('water_rate', 0), label_b: sb.get('water_rate', 0)},
+                {'指标': '总投放', label_a: ta_total, label_b: tb_total},
+                {'指标': '有效线索', label_a: ta_keep, label_b: tb_keep},
+                {'指标': '老客复咨', label_a: ta_old, label_b: tb_old},
+                {'指标': '门店在跟', label_a: ta_flw, label_b: tb_flw},
+                {'指标': '待复核', label_a: ta_review, label_b: tb_review},
+                {'指标': '挤水率%', label_a: ta_wr, label_b: tb_wr},
+                {'指标': '总花费(元)', label_a: round(ta_spent, 2), label_b: round(tb_spent, 2)},
+                {'指标': '有效获客成本(元/条)', label_a: round(ta_ec, 2), label_b: round(tb_ec, 2)},
             ]
             pd.DataFrame(overview).to_excel(writer, sheet_name='核心指标对比', index=False)
 
@@ -509,13 +819,25 @@ class BatchComparator:
                     f'{label_b}_投放': d['b_total'],
                     f'{label_a}_有效': d['a_keep'],
                     f'{label_b}_有效': d['b_keep'],
-                    '有效变化': d['b_keep'] - d['a_keep'],
+                    '有效变化': d['d_keep'],
                     f'{label_a}_挤水率%': d['a_water_rate'],
                     f'{label_b}_挤水率%': d['b_water_rate'],
-                    '挤水率变化': round(d['b_water_rate'] - d['a_water_rate'], 1),
+                    '挤水率变化': d['d_wr'],
+                    f'{label_a}_总花费': d['a_total_spent'],
+                    f'{label_b}_总花费': d['b_total_spent'],
+                    f'{label_a}_有效成本': d['a_effective_cost'],
+                    f'{label_b}_有效成本': d['b_effective_cost'],
+                    '成本变化': d['d_effective_cost'],
+                    '水分趋势': d['water_trend'] or '持平',
+                    '获客趋势': d['real_trend'] or '持平',
+                    '成本趋势': d['cost_trend'] or '持平',
+                    '综合结论': d['combo_trend'] or '-',
                 })
             if ch_rows:
                 pd.DataFrame(ch_rows).to_excel(writer, sheet_name='渠道挤水率对比', index=False)
 
         self._log(f"✅ 导出对比周报 → {path}", Fore.GREEN)
+        self._log(f"   📝 对比结论已生成，可直接复制到日报", Fore.LIGHTCYAN_EX)
+        for line in conclusion_lines[:3]:
+            self._log(f"   {line}", Fore.LIGHTCYAN_EX)
         return path

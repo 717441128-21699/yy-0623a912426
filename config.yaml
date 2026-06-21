@@ -88,6 +88,34 @@ field_aliases:
     - 所属门店
     - store
     - branch
+  cost:
+    - 花费
+    - 消耗
+    - 成本
+    - 投放成本
+    - 广告花费
+    - 日消耗
+    - 消耗金额
+    - cost
+    - spend
+    - spent
+    - expense
+  budget:
+    - 预算
+    - 投放预算
+    - 日预算
+    - budget
+  campaign:
+    - 活动名
+    - 活动名称
+    - 批次
+    - 批次标签
+    - 活动标签
+    - 计划名
+    - 计划名称
+    - campaign
+    - batch
+    - label
 
 # 判重规则配置
 dedup_rules:

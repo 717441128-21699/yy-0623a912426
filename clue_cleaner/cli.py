@@ -52,6 +52,90 @@ def _print_banner():
 ╚══════════════════════════════════════════╝{Style.RESET_ALL}""")
 
 
+def _parse_date(s: str):
+    s = str(s).strip()
+    fmts = [
+        '%Y-%m-%d', '%Y/%m/%d', '%Y%m%d',
+        '%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S',
+        '%Y年%m月%d日', '%m/%d/%Y'
+    ]
+    for fmt in fmts:
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except Exception:
+            continue
+    try:
+        return pd.to_datetime(s, errors='coerce')
+    except Exception:
+        return pd.NaT
+
+
+def _apply_filters(df: pd.DataFrame,
+                   date_from: str = None, date_to: str = None,
+                   channel: str = None, campaign_tag: str = None,
+                   source_file: str = None) -> pd.DataFrame:
+    if df is None:
+        return df
+    mask = pd.Series(True, index=df.index)
+
+    date_cols = [c for c in df.columns if c in ('date', '录入日期', '投放日期', '日期',
+                                                '成交日期', '到店日期')
+                 or 'date' in str(c).lower() or '日期' in str(c)]
+    dt_series = None
+    for c in date_cols:
+        if c in df.columns:
+            dt_series = pd.to_datetime(df[c], errors='coerce')
+            break
+
+    if dt_series is not None and dt_series.notna().any():
+        if date_from:
+            dfrom = _parse_date(date_from)
+            if pd.notna(dfrom):
+                mask &= (dt_series >= dfrom) | dt_series.isna()
+        if date_to:
+            dto = _parse_date(date_to) + pd.Timedelta(days=1)
+            if pd.notna(dto):
+                mask &= (dt_series < dto) | dt_series.isna()
+
+    if channel:
+        chs = [x.strip() for x in channel.split(',') if x.strip()]
+        if chs:
+            col = 'channel' if 'channel' in df.columns else None
+            for c in df.columns:
+                if '渠道' in str(c):
+                    col = c
+                    break
+            if col:
+                ch_mask = pd.Series(False, index=df.index)
+                for ch in chs:
+                    ch_mask |= df[col].astype(str).str.contains(ch, case=False, na=False)
+                mask &= ch_mask
+
+    if campaign_tag:
+        tags = [x.strip() for x in campaign_tag.split(',') if x.strip()]
+        if tags:
+            cand_cols = [c for c in df.columns
+                         if any(k in str(c) for k in
+                                ['活动', '批次', 'campaign', '计划', '标签', 'batch', 'tag'])
+                         or c in ('campaign',)]
+            tag_mask = pd.Series(False, index=df.index)
+            for col in (cand_cols or df.columns.tolist()):
+                col_series = df[col].astype(str)
+                for t in tags:
+                    tag_mask |= col_series.str.contains(t, case=False, na=False)
+            mask &= tag_mask
+
+    if source_file:
+        files = [x.strip() for x in source_file.split(',') if x.strip()]
+        if files and '_source_file' in df.columns:
+            sf_mask = pd.Series(False, index=df.index)
+            for fn in files:
+                sf_mask |= df['_source_file'].astype(str).str.contains(fn, case=False, na=False)
+            mask &= sf_mask
+
+    return df.loc[mask].copy()
+
+
 @click.group(help="🎯 医美线索清洗工具 - 批量判重、挤水、复盘")
 @click.option('--config', '-c', 'config_path', type=click.Path(), default=None,
               help='配置文件路径（默认config.yaml）')
@@ -209,9 +293,20 @@ def precheck(ctx, campaign_file, errors_out):
               help='输出目录')
 @click.option('--skip-export', is_flag=True, help='仅判重不导出')
 @click.option('--report', is_flag=True, help='同时生成运营周报')
+@click.option('--date-from', 'date_from', type=str, default=None,
+              help='筛选起始日期（格式 2024-06-01 或 20240601）')
+@click.option('--date-to', 'date_to', type=str, default=None,
+              help='筛选截止日期（格式 2024-06-30 或 20240630）')
+@click.option('--channel', 'filter_channel', type=str, default=None,
+              help='按渠道筛选（如 抖音，支持逗号分隔多渠道）')
+@click.option('--campaign-tag', 'campaign_tag', type=str, default=None,
+              help='按活动名/批次标签筛选，支持逗号分隔，支持模糊匹配')
+@click.option('--source-file', 'source_file', type=str, default=None,
+              help='按源文件名筛选，支持模糊匹配，逗号分隔')
 @click.pass_context
 def dedup(ctx, campaign_file, history_file, following_file,
-          rule_template, output_dir, skip_export, report):
+          rule_template, output_dir, skip_export, report,
+          date_from, date_to, filter_channel, campaign_tag, source_file):
     cfg = ctx.obj
     if _get_verbose(ctx):
         _print_banner()
@@ -241,8 +336,23 @@ def dedup(ctx, campaign_file, history_file, following_file,
         click.echo(f"{Fore.RED}✗ 没有投放数据，请先用 import 或 -m 指定{Style.RESET_ALL}")
         sys.exit(1)
 
+    filter_info = {}
+    if date_from: filter_info['起始日期'] = date_from
+    if date_to: filter_info['截止日期'] = date_to
+    if filter_channel: filter_info['渠道'] = filter_channel
+    if campaign_tag: filter_info['活动/批次'] = campaign_tag
+    if source_file: filter_info['源文件'] = source_file
+
+    if filter_info:
+        campaign_df = _apply_filters(campaign_df, date_from, date_to,
+                                     filter_channel, campaign_tag, source_file)
+        if campaign_df is None or campaign_df.empty:
+            click.echo(f"{Fore.RED}✗ 筛选后无数据，请放宽条件{Style.RESET_ALL}")
+            sys.exit(1)
+        click.echo(f"{Fore.YELLOW}🔍 筛选后剩余 {len(campaign_df)} 条投放线索{Style.RESET_ALL}")
+
     engine = DedupEngine(cfg, verbose=_get_verbose(ctx))
-    result = engine.run(campaign_df, history_df, following_df)
+    result = engine.run(campaign_df, history_df, following_df, filters=filter_info)
 
     session['dedup_result'] = result
     session['output_dir'] = output_dir
@@ -402,7 +512,11 @@ def _apply_review_result(cfg, result: dict, review_path: str) -> dict:
     result['records'] = records
 
     engine = DedupEngine(cfg, verbose=False)
-    result['summary'] = engine._generate_summary(records)
+    old_summary = result.get('summary', {})
+    campaign_df = result.get('campaign_df')
+    result['summary'] = engine._generate_summary(
+        records, campaign_df, old_summary.get('filters')
+    )
     return result
 
 
@@ -417,9 +531,19 @@ def _apply_review_result(cfg, result: dict, review_path: str) -> dict:
 @click.option('--output', '-o', 'output_dir', type=click.Path(), default='output',
               help='输出目录')
 @click.option('--report', is_flag=True, help='同时生成对比周报')
+@click.option('--a-date-from', 'a_date_from', type=str, default=None, help='A批筛选起始日期')
+@click.option('--a-date-to', 'a_date_to', type=str, default=None, help='A批筛选截止日期')
+@click.option('--a-channel', 'a_channel', type=str, default=None, help='A批按渠道筛选，逗号分隔')
+@click.option('--a-campaign', 'a_campaign', type=str, default=None, help='A批按活动/批次标签筛选')
+@click.option('--b-date-from', 'b_date_from', type=str, default=None, help='B批筛选起始日期')
+@click.option('--b-date-to', 'b_date_to', type=str, default=None, help='B批筛选截止日期')
+@click.option('--b-channel', 'b_channel', type=str, default=None, help='B批按渠道筛选，逗号分隔')
+@click.option('--b-campaign', 'b_campaign', type=str, default=None, help='B批按活动/批次标签筛选')
 @click.pass_context
 def compare(ctx, a_file, b_file, history, following,
-            label_a, label_b, output_dir, report):
+            label_a, label_b, output_dir, report,
+            a_date_from, a_date_to, a_channel, a_campaign,
+            b_date_from, b_date_to, b_channel, b_campaign):
     cfg = ctx.obj
     if _get_verbose(ctx):
         _print_banner()
@@ -428,7 +552,7 @@ def compare(ctx, a_file, b_file, history, following,
     dedup_engine = DedupEngine(cfg, verbose=_get_verbose(ctx))
     session = _load_session()
 
-    def _run_dedup_for(campaign_file, desc):
+    def _run_dedup_for(campaign_file, desc, d_from, d_to, fch, fcp):
         click.echo(f"\n{Fore.CYAN}▶ 判重 {desc}...{Style.RESET_ALL}")
         c_df, _ = loader.load_single(campaign_file, SourceType.CAMPAIGN)
         c_df = loader.normalize_dataframe(c_df)
@@ -440,10 +564,22 @@ def compare(ctx, a_file, b_file, history, following,
         if following:
             f_df, _ = loader.load_single(following, SourceType.FOLLOWING)
             f_df = loader.normalize_dataframe(f_df)
-        return dedup_engine.run(c_df, h_df, f_df)
+
+        f_info = {}
+        if d_from: f_info['起始日期'] = d_from
+        if d_to: f_info['截止日期'] = d_to
+        if fch: f_info['渠道'] = fch
+        if fcp: f_info['活动/批次'] = fcp
+        if f_info:
+            c_df = _apply_filters(c_df, d_from, d_to, fch, fcp)
+            if c_df is None or c_df.empty:
+                click.echo(f"{Fore.RED}✗ {desc} 筛选后无数据，请放宽条件{Style.RESET_ALL}")
+                sys.exit(1)
+            click.echo(f"{Fore.YELLOW}🔍 {desc} 筛选后 {len(c_df)} 条线索{Style.RESET_ALL}")
+        return dedup_engine.run(c_df, h_df, f_df, filters=f_info)
 
     if a_file:
-        result_a = _run_dedup_for(a_file, label_a)
+        result_a = _run_dedup_for(a_file, label_a, a_date_from, a_date_to, a_channel, a_campaign)
     elif 'dedup_result' in session and session['dedup_result']:
         click.echo(f"{Fore.CYAN}▶ 使用会话中已有的 {label_a} 结果{Style.RESET_ALL}")
         result_a = session['dedup_result']
@@ -451,7 +587,7 @@ def compare(ctx, a_file, b_file, history, following,
         click.echo(f"{Fore.RED}✗ 需要 --a-file 指定A批，或先执行 dedup{Style.RESET_ALL}")
         sys.exit(1)
 
-    result_b = _run_dedup_for(b_file, label_b)
+    result_b = _run_dedup_for(b_file, label_b, b_date_from, b_date_to, b_channel, b_campaign)
 
     comparator = BatchComparator(cfg, verbose=_get_verbose(ctx))
     cmp_result = comparator.compare(result_a, result_b, label_a, label_b)
