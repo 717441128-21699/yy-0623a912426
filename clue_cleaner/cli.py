@@ -208,9 +208,10 @@ def precheck(ctx, campaign_file, errors_out):
 @click.option('--output', '-o', 'output_dir', type=click.Path(), default='output',
               help='输出目录')
 @click.option('--skip-export', is_flag=True, help='仅判重不导出')
+@click.option('--report', is_flag=True, help='同时生成运营周报')
 @click.pass_context
 def dedup(ctx, campaign_file, history_file, following_file,
-          rule_template, output_dir, skip_export):
+          rule_template, output_dir, skip_export, report):
     cfg = ctx.obj
     if _get_verbose(ctx):
         _print_banner()
@@ -254,6 +255,10 @@ def dedup(ctx, campaign_file, history_file, following_file,
 
         session['export_paths'] = paths
         _save_session(session)
+
+    if report:
+        exporter = Exporter(cfg, output_dir=output_dir, verbose=_get_verbose(ctx))
+        exporter.export_weekly_report(result)
 
 
 # ==================== review 命令 ====================
@@ -411,9 +416,10 @@ def _apply_review_result(cfg, result: dict, review_path: str) -> dict:
 @click.option('--label-b', default='批次B', help='B批标签')
 @click.option('--output', '-o', 'output_dir', type=click.Path(), default='output',
               help='输出目录')
+@click.option('--report', is_flag=True, help='同时生成对比周报')
 @click.pass_context
 def compare(ctx, a_file, b_file, history, following,
-            label_a, label_b, output_dir):
+            label_a, label_b, output_dir, report):
     cfg = ctx.obj
     if _get_verbose(ctx):
         _print_banner()
@@ -450,6 +456,54 @@ def compare(ctx, a_file, b_file, history, following,
     comparator = BatchComparator(cfg, verbose=_get_verbose(ctx))
     cmp_result = comparator.compare(result_a, result_b, label_a, label_b)
     comparator.export_comparison(cmp_result, output_dir, label_a, label_b)
+
+    if report:
+        comparator.export_compare_report(cmp_result, output_dir, label_a, label_b)
+
+
+# ==================== report 命令 ====================
+@cli.command(help="📊 生成运营周报：核心指标+各渠道挤水率+水分预警")
+@click.option('--format', '-f', 'fmt', type=click.Choice(['both', 'xlsx', 'json']),
+              default='both', help='输出格式: both=Excel+JSON, xlsx, json')
+@click.option('--output', '-o', 'output_dir', type=click.Path(), default=None,
+              help='输出目录')
+@click.pass_context
+def report(ctx, fmt, output_dir):
+    cfg = ctx.obj
+    if _get_verbose(ctx):
+        _print_banner()
+
+    session = _load_session()
+    result = session.get('dedup_result')
+
+    if result is None:
+        click.echo(f"{Fore.RED}✗ 请先执行 dedup 命令{Style.RESET_ALL}")
+        sys.exit(1)
+
+    out_dir = output_dir or session.get('output_dir', 'output')
+    exporter = Exporter(cfg, output_dir=out_dir, verbose=_get_verbose(ctx))
+
+    if fmt in ('both', 'xlsx'):
+        exporter.export_weekly_report(result)
+    if fmt == 'json':
+        summary = result['summary']
+        counts = summary['counts']
+        by_orig = summary.get('by_original_channel', {})
+        report_data = {
+            '生成时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            '总投放线索': counts.get('total', 0),
+            '有效线索': counts.get('keep_count', 0),
+            '老客复咨': counts.get('老客复咨', 0),
+            '门店在跟': counts.get('在跟名单', 0),
+            '待复核': counts.get('大概率重复', 0) + counts.get('疑似重复', 0),
+            '挤水率%': counts.get('water_rate', 0),
+            '各渠道明细': {ch: data for ch, data in by_orig.items()}
+        }
+        os.makedirs(out_dir, exist_ok=True)
+        json_path = os.path.join(out_dir, f"运营周报_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+        click.echo(f"{Fore.GREEN}✅ JSON周报: {json_path}{Style.RESET_ALL}")
 
 
 def main():

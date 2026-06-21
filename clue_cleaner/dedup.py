@@ -34,10 +34,12 @@ class DedupEngine:
         records: Dict[Any, DedupRecord] = {}
         for idx in campaign_df.index:
             row = campaign_df.loc[idx].to_dict()
+            orig_ch = str(row.get('channel', row.get('_source_label', '未知')))
             records[idx] = DedupRecord(
                 row_index=idx,
                 original_row=row,
-                final_channel=str(row.get('channel', row.get('_source_label', '未知')))
+                original_channel=orig_ch,
+                final_channel=orig_ch
             )
 
         self._log(f"📥 加载投放线索: {len(records)} 条", Fore.CYAN)
@@ -273,10 +275,13 @@ class DedupEngine:
     def _mark_group_duplicates(self, records: Dict[Any, DedupRecord],
                                ids: List[Any], rule_name: str,
                                field_key: str, field_val: str, weight: int):
-        ids_sorted = sorted(ids, key=lambda x: records[x].row_index)
-        keep_id = ids_sorted[0]
+        ch_pri = self.config.get_channel_priority
+        ids_by_priority = sorted(ids, key=lambda x: ch_pri(records[x].original_channel))
+        keep_id = ids_by_priority[0]
 
-        for dup_id in ids_sorted[1:]:
+        for dup_id in ids:
+            if dup_id == keep_id:
+                continue
             rec = records[dup_id]
             match = DedupMatch(
                 rule_name=rule_name,
@@ -285,10 +290,11 @@ class DedupEngine:
                 target_index=keep_id,
                 source_index=dup_id,
                 source_type=SourceType.CAMPAIGN,
-                match_detail=f"与行{keep_id}重复"
+                match_detail=f"与行{keep_id}重复(保留:渠道优先级{records[keep_id].original_channel})"
             )
             self._add_match(rec, match)
             rec.matched_with.append(keep_id)
+            rec.hit_channel = records[keep_id].original_channel
 
     def _match_nci_fuzzy(self, records: Dict[Any, DedupRecord],
                          df: pd.DataFrame, rule_cfg: Dict):
@@ -325,8 +331,12 @@ class DedupEngine:
                     combo = name_ratio * 0.6 + intent_ratio * 0.4
 
                     if combo >= threshold:
-                        keep = min(id_a, id_b)
-                        dup = max(id_a, id_b)
+                        ch_pri = self.config.get_channel_priority
+                        pair = [(id_a, ch_pri(records[id_a].original_channel)),
+                                (id_b, ch_pri(records[id_b].original_channel))]
+                        pair.sort(key=lambda x: x[1])
+                        keep = pair[0][0]
+                        dup = pair[1][0]
                         rec = records[dup]
                         self._add_match(rec, DedupMatch(
                             rule_name="姓名+城市+意向模糊匹配",
@@ -340,6 +350,7 @@ class DedupEngine:
                             match_detail=f"综合相似度{combo:.0f}%"
                         ))
                         rec.matched_with.append(keep)
+                        rec.hit_channel = records[keep].original_channel
 
     def _match_name_phone_fuzzy(self, records: Dict[Any, DedupRecord],
                                 df: pd.DataFrame, rule_cfg: Dict):
@@ -364,8 +375,12 @@ class DedupEngine:
                         continue
                     name_ratio = fuzz.ratio(v_a['name'], v_b['name'])
                     if name_ratio >= threshold * 0.9:
-                        keep = min(id_a, id_b)
-                        dup = max(id_a, id_b)
+                        ch_pri = self.config.get_channel_priority
+                        pair = [(id_a, ch_pri(records[id_a].original_channel)),
+                                (id_b, ch_pri(records[id_b].original_channel))]
+                        pair.sort(key=lambda x: x[1])
+                        keep = pair[0][0]
+                        dup = pair[1][0]
                         rec = records[dup]
                         self._add_match(rec, DedupMatch(
                             rule_name="姓名+手机尾号匹配",
@@ -378,6 +393,7 @@ class DedupEngine:
                             match_detail=f"姓名相似度{name_ratio:.0f}%"
                         ))
                         rec.matched_with.append(keep)
+                        rec.hit_channel = records[keep].original_channel
 
     def _add_match(self, record: DedupRecord, match: DedupMatch):
         record.matched_rules.append(match)
@@ -433,13 +449,27 @@ class DedupEngine:
 
     def _resolve_channel_priority(self, records: Dict[Any, DedupRecord]):
         for rec in records.values():
-            candidates = [rec.final_channel]
+            if not rec.matched_rules:
+                rec.final_channel = rec.original_channel
+                continue
+
+            hit_channels = set()
             for m in rec.matched_rules:
                 if m.source_type == SourceType.HISTORY:
-                    candidates.append("历史成交")
+                    hit_channels.add("历史成交")
                 elif m.source_type == SourceType.FOLLOWING:
-                    candidates.append("门店在跟")
+                    hit_channels.add("门店在跟")
+                elif m.source_type == SourceType.CAMPAIGN and m.target_index in records:
+                    target_ch = records[m.target_index].original_channel
+                    if target_ch:
+                        hit_channels.add(target_ch)
 
+            if hit_channels:
+                rec.hit_channel = '; '.join(sorted(hit_channels))
+            else:
+                rec.hit_channel = ""
+
+            candidates = [rec.original_channel] + list(hit_channels)
             best_channel = min(candidates, key=lambda c: self.config.get_channel_priority(c))
             rec.final_channel = best_channel
 
@@ -457,6 +487,7 @@ class DedupEngine:
     def _generate_summary(self, records: Dict[Any, DedupRecord]) -> Dict:
         summary = defaultdict(int)
         by_channel = defaultdict(lambda: defaultdict(int))
+        by_orig_channel = defaultdict(lambda: defaultdict(int))
 
         for rec in records.values():
             summary[rec.level.value] += 1
@@ -465,10 +496,24 @@ class DedupEngine:
             by_channel[rec.final_channel]['total'] += 1
             if rec.keep_row:
                 summary['keep_count'] += 1
+                by_channel[rec.final_channel]['keep_count'] += 1
             if rec.is_old_customer:
                 summary['old_customer'] += 1
             if rec.is_in_following:
                 summary['following'] += 1
+            by_orig_channel[rec.original_channel]['total'] += 1
+            if rec.keep_row:
+                by_orig_channel[rec.original_channel]['keep_count'] += 1
+            else:
+                by_orig_channel[rec.original_channel]['remove_count'] += 1
+            if rec.is_old_customer:
+                by_orig_channel[rec.original_channel]['old_customer'] += 1
+            if rec.is_in_following:
+                by_orig_channel[rec.original_channel]['following'] += 1
+            if rec.level == DedupLevel.DEFINITE:
+                by_orig_channel[rec.original_channel]['definite_dup'] += 1
+            if rec.level in [DedupLevel.PROBABLE, DedupLevel.POSSIBLE]:
+                by_orig_channel[rec.original_channel]['review_count'] += 1
 
         summary['dup_count'] = summary['total'] - summary['keep_count']
         if summary['total'] > 0:
@@ -478,9 +523,16 @@ class DedupEngine:
                 / summary['total'] * 100, 1
             )
 
+        for ch, data in by_orig_channel.items():
+            total = data['total']
+            keep = data.get('keep_count', 0)
+            data['remove_count'] = total - keep
+            data['water_rate'] = round((total - keep) / total * 100, 1) if total else 0
+
         return {
             'counts': dict(summary),
-            'by_channel': {k: dict(v) for k, v in by_channel.items()}
+            'by_channel': {k: dict(v) for k, v in by_channel.items()},
+            'by_original_channel': {k: dict(v) for k, v in by_orig_channel.items()}
         }
 
     def _print_summary(self, summary: Dict):

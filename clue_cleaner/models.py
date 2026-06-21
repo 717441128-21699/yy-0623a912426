@@ -67,6 +67,8 @@ class DedupRecord:
     matched_rules: List[DedupMatch] = field(default_factory=list)
     matched_with: List[Any] = field(default_factory=list)
     final_channel: str = ""
+    original_channel: str = ""
+    hit_channel: str = ""
     is_old_customer: bool = False
     is_in_following: bool = False
     keep_row: bool = True
@@ -78,6 +80,8 @@ class DedupRecord:
         d['_level'] = self.level.value
         d['_matched_rules'] = '; '.join([m.rule_name for m in self.matched_rules])
         d['_matched_with'] = '; '.join([str(x) for x in self.matched_with])
+        d['_original_channel'] = self.original_channel
+        d['_hit_channel'] = self.hit_channel
         d['_final_channel'] = self.final_channel
         d['_is_old_customer'] = '是' if self.is_old_customer else '否'
         d['_is_in_following'] = '是' if self.is_in_following else '否'

@@ -32,12 +32,10 @@ class Exporter:
     def export_all(self, dedup_result: Dict) -> Dict[str, str]:
         records: Dict[Any, DedupRecord] = dedup_result['records']
         paths = {}
-
         paths['valid_clues'] = self.export_valid_clues(records)
         paths['all_results'] = self.export_full_results(records)
         paths['dup_log'] = self.export_duplicate_log(records)
         paths['summary'] = self.export_summary(dedup_result['summary'])
-
         return paths
 
     def export_valid_clues(self, records: Dict[Any, DedupRecord],
@@ -52,7 +50,9 @@ class Exporter:
             d = dict(r.original_row)
             d['_判重评分'] = round(r.score, 1)
             d['_判重等级'] = r.level.value
-            d['_最终渠道'] = r.final_channel
+            d['_原始渠道'] = r.original_channel
+            d['_命中渠道'] = r.hit_channel
+            d['_最终归属渠道'] = r.final_channel
             d['_老客复咨'] = '是' if r.is_old_customer else '否'
             d['_门店在跟'] = '是' if r.is_in_following else '否'
             rows.append(d)
@@ -88,8 +88,9 @@ class Exporter:
                     '匹配来源': m.source_type.value,
                     '匹配对象行': m.target_index,
                     '匹配详情': m.match_detail,
-                    '原始渠道': r.original_row.get('channel', ''),
-                    '最终渠道': r.final_channel,
+                    '原始渠道': r.original_channel,
+                    '命中渠道': r.hit_channel,
+                    '最终归属渠道': r.final_channel,
                     '是否保留': '是' if r.keep_row else '否',
                     '手机号': r.original_row.get('phone', ''),
                     '微信号': r.original_row.get('wechat', ''),
@@ -115,7 +116,7 @@ class Exporter:
             ])
             df_overall.to_excel(writer, sheet_name='整体汇总', index=False)
 
-            by_ch = summary['by_channel']
+            by_ch = summary.get('by_channel', {})
             ch_rows = []
             for ch, data in by_ch.items():
                 row = {'渠道': ch}
@@ -125,6 +126,25 @@ class Exporter:
                 df_ch = pd.DataFrame(ch_rows)
                 df_ch.to_excel(writer, sheet_name='渠道分布', index=False)
 
+            by_orig = summary.get('by_original_channel', {})
+            orig_rows = []
+            for ch, data in by_orig.items():
+                orig_rows.append({
+                    '渠道': ch,
+                    '投放量': data.get('total', 0),
+                    '有效线索': data.get('keep_count', 0),
+                    '剔除量': data.get('remove_count', 0),
+                    '老客复咨': data.get('old_customer', 0),
+                    '门店在跟': data.get('following', 0),
+                    '确定重复': data.get('definite_dup', 0),
+                    '待复核': data.get('review_count', 0),
+                    '挤水率%': data.get('water_rate', 0),
+                })
+            if orig_rows:
+                df_orig = pd.DataFrame(orig_rows)
+                df_orig = df_orig.sort_values('投放量', ascending=False)
+                df_orig.to_excel(writer, sheet_name='渠道投放明细', index=False)
+
         self._log(f"✅ 导出统计汇总 → {path}", Fore.GREEN)
         return path
 
@@ -132,48 +152,51 @@ class Exporter:
                                 campaign_df: pd.DataFrame = None,
                                 filename: str = "人工复核包.xlsx") -> str:
         review_records = [r for r in records.values()
-                          if r.level in [DedupLevel.POSSIBLE, DedupLevel.PROBABLE]
-                          or (r.matched_rules and r.score >= 50)]
-
-        if not review_records:
-            self._log("ℹ 无需人工复核的记录", Fore.LIGHTBLACK_EX)
-            return ""
+                          if r.level in [DedupLevel.POSSIBLE, DedupLevel.PROBABLE]]
 
         path = self._p(filename)
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
             rows = []
+            seen_pairs = set()
             for r in review_records:
-                matched_pairs = set()
                 for m in r.matched_rules:
-                    a = min(r.row_index, m.target_index)
-                    b = max(r.row_index, m.target_index)
-                    if a != b:
-                        matched_pairs.add((a, b))
+                    target_idx = m.target_index
+                    if target_idx not in records:
+                        continue
+                    pair_key = tuple(sorted([r.row_index, target_idx]))
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
 
-                for a, b in matched_pairs:
-                    rec_a = records[a].original_row if a in records else {}
-                    rec_b = records[b].original_row if b in records else {}
+                    rec_a = records[pair_key[0]]
+                    rec_b = records[pair_key[1]]
+                    a_row = rec_a.original_row
+                    b_row = rec_b.original_row
+
                     row = {
-                        '复核组ID': f"G_{a}_{b}",
-                        'A行号': a,
-                        'B行号': b,
-                        'A_手机号': rec_a.get('phone', ''),
-                        'B_手机号': rec_b.get('phone', ''),
-                        'A_微信号': rec_a.get('wechat', ''),
-                        'B_微信号': rec_b.get('wechat', ''),
-                        'A_姓名': rec_a.get('name', ''),
-                        'B_姓名': rec_b.get('name', ''),
-                        'A_生日': rec_a.get('birthday', ''),
-                        'B_生日': rec_b.get('birthday', ''),
-                        'A_城市': rec_a.get('city', ''),
-                        'B_城市': rec_b.get('city', ''),
-                        'A_意向': str(rec_a.get('intention', ''))[:50],
-                        'B_意向': str(rec_b.get('intention', ''))[:50],
-                        'A_渠道': rec_a.get('channel', ''),
-                        'B_渠道': rec_b.get('channel', ''),
+                        '复核组ID': f"G_{pair_key[0]}_{pair_key[1]}",
+                        'A行号': pair_key[0],
+                        'B行号': pair_key[1],
+                        'A_手机号': a_row.get('phone', ''),
+                        'B_手机号': b_row.get('phone', ''),
+                        'A_微信号': a_row.get('wechat', ''),
+                        'B_微信号': b_row.get('wechat', ''),
+                        'A_姓名': a_row.get('name', ''),
+                        'B_姓名': b_row.get('name', ''),
+                        'A_生日': a_row.get('birthday', ''),
+                        'B_生日': b_row.get('birthday', ''),
+                        'A_城市': a_row.get('city', ''),
+                        'B_城市': b_row.get('city', ''),
+                        'A_意向': str(a_row.get('intention', ''))[:50],
+                        'B_意向': str(b_row.get('intention', ''))[:50],
+                        'A_渠道': rec_a.original_channel,
+                        'B_渠道': rec_b.original_channel,
+                        'A_最终归属': rec_a.final_channel,
+                        'B_最终归属': rec_b.final_channel,
                         '最高相似度': round(r.score, 1),
-                        '匹配规则': '; '.join([m.rule_name for m in r.matched_rules]),
-                        '建议操作': '保留A，剔除B' if r.score >= 75 else '请人工确认',
+                        '匹配规则': '; '.join([m2.rule_name for m2 in r.matched_rules
+                                               if m2.target_index in records]),
+                        '建议操作': '保留高优先渠道，剔除低优先' if r.score >= 75 else '请人工确认',
                         '人工复核结果': '',
                         '备注': '',
                     }
@@ -182,46 +205,125 @@ class Exporter:
             if rows:
                 df_review = pd.DataFrame(rows)
                 df_review.to_excel(writer, sheet_name='待复核', index=False)
+            else:
+                pd.DataFrame([{'说明': '无需人工复核的记录'}]).to_excel(writer, sheet_name='待复核', index=False)
 
-                df_decision = pd.DataFrame([
-                    {'选项': ['A为独立、B剔除', 'B为独立、A剔除', '两者都保留（不同人）', '两者都剔除（老客/在跟）',
-                             '需要进一步确认']}
-                ])
-                df_decision.to_excel(writer, sheet_name='复核参考', index=False)
+            pd.DataFrame([
+                {'选项': v} for v in [
+                    'A为独立、B剔除', 'B为独立、A剔除', '两者都保留（不同人）',
+                    '两者都剔除（老客/在跟）', '需要进一步确认'
+                ]
+            ]).to_excel(writer, sheet_name='复核参考', index=False)
 
-            dup_rows = []
+            removed_rows = []
             for r in records.values():
-                if r.level == DedupLevel.DEFINITE:
-                    dup_rows.append({
+                if r.level in [DedupLevel.OLD_CUSTOMER, DedupLevel.FOLLOWING, DedupLevel.DEFINITE]:
+                    removed_rows.append({
                         '行号': r.row_index,
+                        '剔除类型': r.level.value,
                         '匹配规则': '; '.join([m.rule_name for m in r.matched_rules]),
-                        '匹配对象': '; '.join([str(x) for x in r.matched_with]),
-                        '相似度': round(r.score, 1),
+                        '匹配对象行': '; '.join([str(x) for x in r.matched_with]),
+                        '匹配详情': '; '.join([m.match_detail for m in r.matched_rules[:3]]),
                         '手机号': r.original_row.get('phone', ''),
                         '微信号': r.original_row.get('wechat', ''),
                         '姓名': r.original_row.get('name', ''),
-                        '渠道': r.original_row.get('channel', ''),
+                        '原始渠道': r.original_channel,
+                        '命中渠道': r.hit_channel,
+                        '最终归属': r.final_channel,
+                        '相似度': round(r.score, 1),
                     })
-            if dup_rows:
-                pd.DataFrame(dup_rows).to_excel(writer, sheet_name='确定重复(已剔除)', index=False)
-
-            old_rows = []
-            for r in records.values():
-                if r.level == DedupLevel.OLD_CUSTOMER or r.level == DedupLevel.FOLLOWING:
-                    old_rows.append({
-                        '行号': r.row_index,
-                        '类型': r.level.value,
-                        '命中规则': '; '.join([m.rule_name for m in r.matched_rules]),
-                        '详情': '; '.join([m.match_detail for m in r.matched_rules[:3]]),
-                        '手机号': r.original_row.get('phone', ''),
-                        '姓名': r.original_row.get('name', ''),
-                        '原始渠道': r.original_row.get('channel', ''),
-                    })
-            if old_rows:
-                pd.DataFrame(old_rows).to_excel(writer, sheet_name='老客_在跟(已剔除)', index=False)
+            if removed_rows:
+                pd.DataFrame(removed_rows).to_excel(writer, sheet_name='已剔除说明', index=False)
 
         self._log(f"✅ 生成人工复核包 → {path}", Fore.GREEN)
         return path
+
+    def export_weekly_report(self, dedup_result: Dict,
+                             filename: str = "运营周报.xlsx",
+                             json_filename: str = "运营周报.json") -> Tuple[str, str]:
+        records = dedup_result['records']
+        summary = dedup_result['summary']
+        counts = summary['counts']
+        by_orig = summary.get('by_original_channel', {})
+
+        total = counts.get('total', 0)
+        keep = counts.get('keep_count', 0)
+        old_c = counts.get('老客复咨', 0)
+        following = counts.get('在跟名单', 0)
+        definite = counts.get('确定重复', 0)
+        probable = counts.get('大概率重复', 0)
+        possible = counts.get('疑似重复', 0)
+        review_count = probable + possible
+
+        report = {
+            '生成时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            '总投放线索': total,
+            '有效线索': keep,
+            '老客复咨': old_c,
+            '门店在跟': following,
+            '确定重复': definite,
+            '待复核': review_count,
+            '挤水率%': counts.get('water_rate', 0),
+            '重复率%': counts.get('dup_rate', 0),
+            '各渠道明细': {}
+        }
+
+        for ch, data in by_orig.items():
+            report['各渠道明细'][ch] = {
+                '投放量': data.get('total', 0),
+                '有效线索': data.get('keep_count', 0),
+                '剔除量': data.get('remove_count', 0),
+                '老客复咨': data.get('old_customer', 0),
+                '门店在跟': data.get('following', 0),
+                '确定重复': data.get('definite_dup', 0),
+                '待复核': data.get('review_count', 0),
+                '挤水率%': data.get('water_rate', 0),
+            }
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        xlsx_path = self._p(filename)
+        with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+            overview_rows = []
+            for k, v in report.items():
+                if k == '各渠道明细':
+                    continue
+                overview_rows.append({'指标': k, '数值': v})
+            pd.DataFrame(overview_rows).to_excel(writer, sheet_name='核心指标', index=False)
+
+            ch_rows = []
+            for ch, data in report['各渠道明细'].items():
+                row = {'渠道': ch}
+                row.update(data)
+                ch_rows.append(row)
+            if ch_rows:
+                df_ch = pd.DataFrame(ch_rows)
+                df_ch = df_ch.sort_values('投放量', ascending=False)
+                df_ch.to_excel(writer, sheet_name='渠道挤水率', index=False)
+
+            sorted_channels = sorted(report['各渠道明细'].items(),
+                                     key=lambda x: x[1].get('挤水率%', 0), reverse=True)
+            alert_rows = []
+            for ch, data in sorted_channels[:5]:
+                if data.get('投放量', 0) > 0:
+                    alert_rows.append({
+                        '渠道': ch,
+                        '投放量': data['投放量'],
+                        '挤水率%': data['挤水率%'],
+                        '有效线索': data['有效线索'],
+                        '老客+在跟': data.get('老客复咨', 0) + data.get('门店在跟', 0),
+                        '建议': '重点关注' if data['挤水率%'] > 20 else '正常'
+                    })
+            if alert_rows:
+                pd.DataFrame(alert_rows).to_excel(writer, sheet_name='水分预警', index=False)
+
+        self._log(f"✅ 导出运营周报 → {xlsx_path}", Fore.GREEN)
+
+        json_path = os.path.join(self.output_dir, json_filename.replace('.json', f'_{self._ts()}.json'))
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        self._log(f"✅ 导出周报JSON → {json_path}", Fore.GREEN)
+
+        return xlsx_path, json_path
 
 
 class BatchComparator:
@@ -258,39 +360,52 @@ class BatchComparator:
         only_a = keys_a - keys_b
         only_b = keys_b - keys_a
 
-        self._log("\n" + "=" * 60, Fore.CYAN)
+        sa = result_a['summary']['counts']
+        sb = result_b['summary']['counts']
+        ocha = result_a['summary'].get('by_original_channel', {})
+        ochb = result_b['summary'].get('by_original_channel', {})
+
+        self._log("\n" + "=" * 70, Fore.CYAN)
         self._log(f"🔍 批次对比: {label_a} vs {label_b}", Fore.CYAN + Style.BRIGHT)
-        self._log("=" * 60, Fore.CYAN)
+        self._log("=" * 70, Fore.CYAN)
         self._log(f"  {label_a}唯一键数: {len(keys_a)}")
         self._log(f"  {label_b}唯一键数: {len(keys_b)}")
         self._log(f"  两批共有: {len(common)}", Fore.GREEN)
         self._log(f"  仅{label_a}: {len(only_a)}", Fore.YELLOW)
         self._log(f"  仅{label_b}: {len(only_b)}", Fore.YELLOW)
 
-        sa = result_a['summary']['counts']
-        sb = result_b['summary']['counts']
         self._log(f"\n  {label_a} 有效线索: {sa.get('keep_count', 0)} (挤水率{sa.get('water_rate', 0)}%)")
         self._log(f"  {label_b} 有效线索: {sb.get('keep_count', 0)} (挤水率{sb.get('water_rate', 0)}%)")
         delta = sb.get('keep_count', 0) - sa.get('keep_count', 0)
         delta_w = round(sb.get('water_rate', 0) - sa.get('water_rate', 0), 1)
-        color_d = Fore.GREEN if delta > 0 else (Fore.RED if delta < 0 else Fore.LIGHTBLACK_EX)
-        self._log(f"  有效线索变化: {delta:+d} {color_d}", Fore.WHITE)
-        color_w = Fore.RED if delta_w > 0 else (Fore.GREEN if delta_w < 0 else Fore.LIGHTBLACK_EX)
-        self._log(f"  挤水率变化: {delta_w:+.1f}% {color_w}", Fore.WHITE)
+        self._log(f"  有效线索变化: {delta:+d}", Fore.GREEN if delta > 0 else Fore.RED)
+        self._log(f"  挤水率变化: {delta_w:+.1f}%", Fore.RED if delta_w > 0 else Fore.GREEN)
 
-        cha = result_a['summary']['by_channel']
-        chb = result_b['summary']['by_channel']
-        all_ch = set(cha.keys()) | set(chb.keys())
-        self._log(f"\n  渠道明细:", Fore.CYAN)
+        self._log(f"\n  📊 渠道复盘明细:", Fore.CYAN)
+        all_ch = set(ocha.keys()) | set(ochb.keys())
         for ch in sorted(all_ch):
-            a_val = cha.get(ch, {}).get('keep_count', cha.get(ch, {}).get('total', 0))
-            b_val = chb.get(ch, {}).get('keep_count', chb.get(ch, {}).get('total', 0))
-            d = b_val - a_val
-            tag = f"({d:+d})" if d else ""
-            color = Fore.GREEN if d > 0 else (Fore.RED if d < 0 else Fore.WHITE)
-            self._log(f"    {ch}: {a_val} → {b_val} {color}{tag}", Fore.WHITE)
+            a_data = ocha.get(ch, {})
+            b_data = ochb.get(ch, {})
+            a_total = a_data.get('total', 0)
+            b_total = b_data.get('total', 0)
+            a_keep = a_data.get('keep_count', 0)
+            b_keep = b_data.get('keep_count', 0)
+            a_wr = a_data.get('water_rate', 0)
+            b_wr = b_data.get('water_rate', 0)
+            d_keep = b_keep - a_keep
+            d_wr = round(b_wr - a_wr, 1)
+            water_tag = "↑水分变高" if d_wr > 5 else ("↓水分改善" if d_wr < -5 else "")
+            real_tag = "↑获客变好" if d_keep > 0 else ("↓获客变差" if d_keep < 0 else "")
 
-        self._log("=" * 60 + "\n", Fore.CYAN)
+            self._log(f"    {ch}:", Fore.CYAN)
+            self._log(f"      投放 {a_total}→{b_total}  有效 {a_keep}→{b_keep}({d_keep:+d}) "
+                      f"挤水率 {a_wr}%→{b_wr}%({d_wr:+.1f}%)", Fore.WHITE)
+            if water_tag:
+                self._log(f"      ⚠ {water_tag}", Fore.RED if "高" in water_tag else Fore.GREEN)
+            if real_tag:
+                self._log(f"      💡 {real_tag}", Fore.GREEN if "好" in real_tag else Fore.RED)
+
+        self._log("=" * 70 + "\n", Fore.CYAN)
 
         return {
             'common_keys': list(common),
@@ -298,9 +413,19 @@ class BatchComparator:
             'only_b_keys': list(only_b),
             'summary_a': sa,
             'summary_b': sb,
+            'by_original_a': ocha,
+            'by_original_b': ochb,
             'channel_diff': {
-                ch: {'a': cha.get(ch, {}).get('keep_count', cha.get(ch, {}).get('total', 0)),
-                     'b': chb.get(ch, {}).get('keep_count', chb.get(ch, {}).get('total', 0))}
+                ch: {
+                    'a_total': ocha.get(ch, {}).get('total', 0),
+                    'a_keep': ocha.get(ch, {}).get('keep_count', 0),
+                    'a_remove': ocha.get(ch, {}).get('remove_count', 0),
+                    'a_water_rate': ocha.get(ch, {}).get('water_rate', 0),
+                    'b_total': ochb.get(ch, {}).get('total', 0),
+                    'b_keep': ochb.get(ch, {}).get('keep_count', 0),
+                    'b_remove': ochb.get(ch, {}).get('remove_count', 0),
+                    'b_water_rate': ochb.get(ch, {}).get('water_rate', 0),
+                }
                 for ch in all_ch
             }
         }
@@ -314,28 +439,83 @@ class BatchComparator:
 
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
             rows = []
-            for ch, d in cmp_result['channel_diff'].items():
+            for ch in sorted(cmp_result['channel_diff'].keys()):
+                d = cmp_result['channel_diff'][ch]
+                d_keep = d['b_keep'] - d['a_keep']
+                d_wr = round(d['b_water_rate'] - d['a_water_rate'], 1)
                 rows.append({
                     '渠道': ch,
-                    f'{label_a}_有效': d['a'],
-                    f'{label_b}_有效': d['b'],
-                    '变化量': d['b'] - d['a'],
-                    '变化率%': round((d['b'] - d['a']) / d['a'] * 100, 1) if d['a'] else None
+                    f'{label_a}_投放量': d['a_total'],
+                    f'{label_b}_投放量': d['b_total'],
+                    f'{label_a}_有效线索': d['a_keep'],
+                    f'{label_b}_有效线索': d['b_keep'],
+                    '有效线索变化': d_keep,
+                    f'{label_a}_剔除量': d['a_remove'],
+                    f'{label_b}_剔除量': d['b_remove'],
+                    f'{label_a}_挤水率%': d['a_water_rate'],
+                    f'{label_b}_挤水率%': d['b_water_rate'],
+                    '挤水率变化': d_wr,
+                    '水分趋势': '↑变高' if d_wr > 5 else ('↓改善' if d_wr < -5 else '持平'),
+                    '获客趋势': '↑变好' if d_keep > 0 else ('↓变差' if d_keep < 0 else '持平'),
                 })
-            pd.DataFrame(rows).to_excel(writer, sheet_name='渠道对比', index=False)
+            pd.DataFrame(rows).to_excel(writer, sheet_name='渠道复盘', index=False)
 
             sa = cmp_result['summary_a']
             sb = cmp_result['summary_b']
             rows2 = []
             all_keys = set(sa.keys()) | set(sb.keys())
             for k in sorted(all_keys):
-                rows2.append({'指标': k, label_a: sa.get(k, 0), label_b: sb.get(k, 0)})
+                rows2.append({'指标': k, label_a: sa.get(k, 0), label_b: sb.get(k, 0), '变化': sb.get(k, 0) - sa.get(k, 0)})
             pd.DataFrame(rows2).to_excel(writer, sheet_name='整体对比', index=False)
 
-            pd.DataFrame([{'唯一键类型': k[0], '值': k[1]} for k in cmp_result['only_b_keys']]
-                         ).to_excel(writer, sheet_name=f'新增于{label_b}', index=False)
-            pd.DataFrame([{'唯一键类型': k[0], '值': k[1]} for k in cmp_result['only_a_keys']]
-                         ).to_excel(writer, sheet_name=f'消失于{label_b}', index=False)
+            if cmp_result.get('only_b_keys'):
+                pd.DataFrame([{'唯一键类型': k[0], '值': k[1]} for k in cmp_result['only_b_keys']]
+                             ).to_excel(writer, sheet_name=f'新增于{label_b}', index=False)
+            if cmp_result.get('only_a_keys'):
+                pd.DataFrame([{'唯一键类型': k[0], '值': k[1]} for k in cmp_result['only_a_keys']]
+                             ).to_excel(writer, sheet_name=f'消失于{label_b}', index=False)
 
         self._log(f"✅ 导出批次对比 → {path}", Fore.GREEN)
+        return path
+
+    def export_compare_report(self, cmp_result: Dict,
+                              output_dir: str = "output",
+                              label_a: str = "批次A", label_b: str = "批次B") -> str:
+        os.makedirs(output_dir, exist_ok=True)
+        ts = datetime.now().strftime(self.config.output.get('date_format', '%Y%m%d_%H%M%S'))
+        path = os.path.join(output_dir, f"对比周报_{ts}.xlsx")
+
+        sa = cmp_result['summary_a']
+        sb = cmp_result['summary_b']
+
+        with pd.ExcelWriter(path, engine='openpyxl') as writer:
+            overview = [
+                {'指标': '总投放', label_a: sa.get('total', 0), label_b: sb.get('total', 0)},
+                {'指标': '有效线索', label_a: sa.get('keep_count', 0), label_b: sb.get('keep_count', 0)},
+                {'指标': '老客复咨', label_a: sa.get('老客复咨', 0), label_b: sb.get('老客复咨', 0)},
+                {'指标': '门店在跟', label_a: sa.get('在跟名单', 0), label_b: sb.get('在跟名单', 0)},
+                {'指标': '待复核', label_a: sa.get('大概率重复', 0) + sa.get('疑似重复', 0),
+                 label_b: sb.get('大概率重复', 0) + sb.get('疑似重复', 0)},
+                {'指标': '挤水率%', label_a: sa.get('water_rate', 0), label_b: sb.get('water_rate', 0)},
+            ]
+            pd.DataFrame(overview).to_excel(writer, sheet_name='核心指标对比', index=False)
+
+            ch_rows = []
+            for ch in sorted(cmp_result['channel_diff'].keys()):
+                d = cmp_result['channel_diff'][ch]
+                ch_rows.append({
+                    '渠道': ch,
+                    f'{label_a}_投放': d['a_total'],
+                    f'{label_b}_投放': d['b_total'],
+                    f'{label_a}_有效': d['a_keep'],
+                    f'{label_b}_有效': d['b_keep'],
+                    '有效变化': d['b_keep'] - d['a_keep'],
+                    f'{label_a}_挤水率%': d['a_water_rate'],
+                    f'{label_b}_挤水率%': d['b_water_rate'],
+                    '挤水率变化': round(d['b_water_rate'] - d['a_water_rate'], 1),
+                })
+            if ch_rows:
+                pd.DataFrame(ch_rows).to_excel(writer, sheet_name='渠道挤水率对比', index=False)
+
+        self._log(f"✅ 导出对比周报 → {path}", Fore.GREEN)
         return path

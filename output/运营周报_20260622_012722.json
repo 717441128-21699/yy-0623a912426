@@ -1,0 +1,74 @@
+{
+  "生成时间": "2026-06-22 01:27:22",
+  "总投放线索": 320,
+  "有效线索": 275,
+  "老客复咨": 30,
+  "门店在跟": 10,
+  "待复核": 5,
+  "挤水率%": 14.1,
+  "各渠道明细": {
+    "小红书": {
+      "total": 51,
+      "remove_count": 4,
+      "old_customer": 2,
+      "definite_dup": 2,
+      "keep_count": 47,
+      "review_count": 2,
+      "water_rate": 7.8
+    },
+    "百度": {
+      "total": 42,
+      "remove_count": 6,
+      "old_customer": 4,
+      "definite_dup": 1,
+      "keep_count": 36,
+      "following": 1,
+      "review_count": 1,
+      "water_rate": 14.3
+    },
+    "美团": {
+      "total": 53,
+      "remove_count": 9,
+      "old_customer": 6,
+      "keep_count": 44,
+      "following": 3,
+      "water_rate": 17.0
+    },
+    "大众点评": {
+      "total": 42,
+      "remove_count": 6,
+      "old_customer": 4,
+      "keep_count": 36,
+      "following": 1,
+      "review_count": 1,
+      "definite_dup": 1,
+      "water_rate": 14.3
+    },
+    "抖音": {
+      "total": 38,
+      "remove_count": 6,
+      "old_customer": 5,
+      "keep_count": 32,
+      "following": 1,
+      "water_rate": 15.8
+    },
+    "新氧": {
+      "total": 49,
+      "remove_count": 9,
+      "old_customer": 6,
+      "keep_count": 40,
+      "following": 3,
+      "review_count": 1,
+      "water_rate": 18.4
+    },
+    "朋友圈广告": {
+      "total": 45,
+      "keep_count": 40,
+      "remove_count": 5,
+      "following": 1,
+      "old_customer": 3,
+      "definite_dup": 1,
+      "water_rate": 11.1
+    }
+  }
+}
